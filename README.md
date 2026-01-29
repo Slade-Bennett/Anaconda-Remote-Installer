@@ -5,26 +5,26 @@ A PowerShell script that installs Anaconda on remote Windows machines via PowerS
 ## Requirements
 
 - **Local machine**: PowerShell 5.1+, Administrator privileges
-- **Remote machine**: WinRM enabled, network access to the installer location
-- **Network**: ICMP (ping) allowed between machines
+- **Remote machine**: WinRM enabled, admin share accessible (`\\hostname\C$`)
+- **Network**: DNS resolution, ICMP (ping), and WinRM (TCP 5985/5986) allowed
 
 ## Usage
 
-### Interactive Mode
 ```powershell
+# Display help
 .\Install-Anaconda.ps1
-```
-Prompts for the target hostname.
+.\Install-Anaconda.ps1 -Help
 
-### Direct Mode
-```powershell
+# Install using hostname
 .\Install-Anaconda.ps1 -ComputerName "SERVER01"
+
+# Install using IP address
 .\Install-Anaconda.ps1 -ComputerName "10.0.0.100"
 ```
 
 ## Configuration
 
-Edit these variables at the top of the script (lines 42-47):
+Edit these variables at the top of the script (lines 50-55):
 
 | Variable | Description | Default |
 |----------|-------------|---------|
@@ -44,75 +44,79 @@ LOCAL MACHINE
 ─────────────────────────────────────────────────────
 1. Administrator Check
    - Verifies script is running elevated
-   - Exits with code 1 if not admin
+   - Exits with code 1 if not admin (red text)
 
-2. Hostname Input
-   - Uses -ComputerName parameter if provided
-   - Otherwise prompts via Read-Host
+2. Input Check
+   - If no -ComputerName provided, displays help menu
+   - If -Help flag used, displays help menu
 
-3. Pre-flight Connectivity Checks
-   - ICMP ping test (2 packets)
+3. Pre-flight Connectivity Checks (Test-TargetConnectivity)
+   - DNS resolution ([System.Net.Dns]::GetHostEntry)
+   - ICMP ping test (Test-Connection, 2 packets)
    - WinRM availability test (Test-WSMan)
 
-4. Invoke-Command to Remote Machine
+4. File Copy via Admin Share (Copy-InstallerToRemote)
+   - Checks/creates \\hostname\C$\Temp directory
+   - Verifies source installer exists on network share
+   - Copies installer via admin share (avoids double-hop)
+   - Verifies file exists at destination
+
+5. Remote Installation (Invoke-RemoteInstall)
          │
          ▼
-REMOTE MACHINE (via PowerShell Remoting)
+REMOTE MACHINE (via Invoke-Command)
 ─────────────────────────────────────────────────────
-5. Create Temp Directory
-   - Creates C:\Temp if it doesn't exist
-
-6. Copy Installer*
-   - Copies from network share to C:\Temp
-   - Remote machine needs access to the share
-
-7. Run Silent Installation
+6. Run Silent Installation
    - Executes: installer.exe /S /AddToPath=1 /D=<path>
    - Waits for process to complete
    - Captures NSIS exit code
 
-8. Verify Installation
+7. Verify Installation
    - Checks if conda.exe exists in Scripts folder
 
-9. Cleanup*
+8. Cleanup
    - Removes installer from C:\Temp
 
-10. Return result object to local machine
+9. Return result object to local machine
          │
          ▼
 LOCAL MACHINE
 ─────────────────────────────────────────────────────
-11. Display Remote Messages
+10. Display Remote Messages
     - Color-coded: Red=ERROR, Yellow=WARNING, Gray=INFO
 
-12. Exit with Appropriate Code
+11. Exit with Appropriate Code
 ```
-
-*Currently commented out for testing
 
 ### Key Components
 
 #### Pre-flight Checks (`Test-TargetConnectivity`)
 Validates connectivity before attempting installation:
+- **DNS Test**: Resolves hostname via `[System.Net.Dns]::GetHostEntry`
 - **Ping Test**: `Test-Connection` with 2 ICMP packets
 - **WinRM Test**: `Test-WSMan` verifies PowerShell remoting is available
 
+#### File Copy (`Copy-InstallerToRemote`)
+Copies installer to remote machine via admin share:
+- Uses `\\hostname\C$\Temp` path (avoids WinRM double-hop issue)
+- Creates destination directory if it doesn't exist
+- Verifies source file exists before copying
+- Confirms file arrived at destination after copy
+
 #### Remote ScriptBlock (`$Script:RemoteInstallScriptBlock`)
-Executes entirely on the remote machine via `Invoke-Command`:
-1. Creates temp directory if needed
-2. Copies installer from network share (currently disabled)
-3. Builds installer arguments from configuration
-4. Runs installer silently with `Start-Process -Wait`
-5. Verifies `conda.exe` exists after installation
+Executes on the remote machine via `Invoke-Command`:
+1. Verifies installer exists at `C:\Temp`
+2. Builds installer arguments from configuration
+3. Runs installer silently with `Start-Process -Wait`
+4. Verifies `conda.exe` exists after installation
+5. Cleans up installer file
 6. Returns result object with exit code and messages
 
 #### Main Function (`Invoke-RemoteInstall`)
-Orchestrates the installation:
-1. Displays banner with target hostname
-2. Runs connectivity checks
-3. Executes remote scriptblock via `Invoke-Command`
-4. Displays color-coded messages from remote execution
-5. Returns final exit code
+Executes the remote scriptblock and handles results:
+1. Calls `Invoke-Command` with the scriptblock
+2. Displays color-coded messages from remote execution
+3. Returns final exit code
 
 ### Anaconda Silent Install Arguments
 
@@ -129,12 +133,14 @@ Orchestrates the installation:
 |------|-------------|
 | 0 | Success |
 | 1 | Not run as Administrator |
-| 2 | No hostname provided |
 | 10 | Target unreachable (ping failed) |
+| 11 | DNS resolution failed |
 | 12 | WinRM unavailable on target |
 | 13 | Remote session failed |
 | 20 | Failed to create temp directory |
-| 21 | File copy failed / installer not found |
+| 21 | Source file not found |
+| 22 | File copy failed |
+| 23 | File copy verification failed |
 | 99 | Unexpected error |
 | 101 | NSIS: Installation cancelled by user |
 | 102 | NSIS: Installation aborted (disk space, permissions, path) |
@@ -148,20 +154,32 @@ Anaconda uses NSIS (Nullsoft Scriptable Install System). NSIS codes are passed t
 
 ## Troubleshooting
 
+### "Cannot resolve hostname in DNS"
+The hostname could not be resolved. Verify:
+- Hostname is spelled correctly
+- DNS server is reachable
+- Host has a DNS record (try `nslookup hostname`)
+
 ### "WinRM unavailable"
 Enable WinRM on the remote machine:
 ```powershell
 Enable-PSRemoting -Force
 ```
 
-### "Access denied" on network share
-The remote session runs under the machine's computer account, not your user account. Grant the remote machine's computer account read access to the share.
+### "Failed to create temp directory" or "Access denied"
+The admin share (`\\hostname\C$`) is not accessible. Verify:
+- You have administrative rights on the remote machine
+- File and Printer Sharing is enabled
+- Admin shares are not disabled via Group Policy
 
-### "Installer not found"
-Verify the filename matches exactly, including `.exe` extension.
+### "Source file not found"
+Verify the installer path and filename:
+- Check `NetworkSharePath` points to correct location
+- Check `InstallerFilename` matches exactly, including `.exe` extension
+- Verify you have read access to the network share
 
 ### Installation succeeds but conda.exe not found
 NSIS may report success when installation fails silently. Check:
-- Sufficient disk space
+- Sufficient disk space on remote machine
 - Write permissions to install path
 - Path length under 260 characters
