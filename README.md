@@ -183,3 +183,9 @@ NSIS may report success when installation fails silently. Check:
 - Sufficient disk space on remote machine
 - Write permissions to install path
 - Path length under 260 characters
+
+## 📜 License
+
+This project is licensed under the **[MIT License](LICENSE)** - feel free to use, modify, and distribute.
+
+---
